@@ -38,18 +38,51 @@ func (fs *fscache) Put(key v1.Hash, layer v1.Layer, compressed bool) (v1.Layer, 
 	if err != nil {
 		return nil, fmt.Errorf("reading layer: %w", err)
 	}
-	// create the file
-	w, err := create(fs.path, key)
+	// closing the reader releases resources held by the
+	// underlying layer. For remote layers this includes the
+	// go-containerregistry pull limiter token, so failing to
+	// close it leaks a token and eventually deadlocks the build.
+	defer rc.Close()
+
+	mediaType, err := layer.MediaType()
+	if err != nil {
+		return nil, fmt.Errorf("getting media type: %w", err)
+	}
+
+	// write to a temporary file and rename it into place
+	// so that a failed copy never leaves a partial layer
+	// in the cache.
+	if err := os.MkdirAll(fs.path, 0700); err != nil {
+		return nil, fmt.Errorf("preparing fs: %w", err)
+	}
+	path := cachepath(fs.path, key)
+	w, err := os.CreateTemp(fs.path, filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return nil, fmt.Errorf("preparing fs: %w", err)
 	}
-	defer w.Close()
-	// copy the layer into the file
-	_, err = io.Copy(w, rc)
-	if err != nil {
+	tmp := w.Name()
+	if _, err := io.Copy(w, rc); err != nil {
+		_ = w.Close()
+		_ = os.Remove(tmp)
 		return nil, fmt.Errorf("writing layer: %w", err)
 	}
-	return layer, nil
+	if err := w.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return nil, fmt.Errorf("writing layer: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return nil, fmt.Errorf("writing layer: %w", err)
+	}
+
+	// return a layer backed by the file we just wrote rather
+	// than the original layer, so that later reads don't go
+	// back to the original (possibly remote) source.
+	l, err := tarball.LayerFromFile(path, tarball.WithMediaType(mediaType))
+	if err != nil {
+		return nil, fmt.Errorf("reading cached layer: %w", err)
+	}
+	return l, nil
 }
 
 func (fs *fscache) Get(hash v1.Hash) (v1.Layer, error) {
